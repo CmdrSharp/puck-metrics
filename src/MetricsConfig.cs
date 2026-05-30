@@ -6,10 +6,10 @@ namespace PuckMetrics
 {
     public class MetricsConfig
     {
-        public int Port { get; set; } = 9100;
-        public float UpdateIntervalSeconds { get; set; } = 2f;
-        public bool EnablePerPlayerMetrics { get; set; } = false;
-        public string BindAddress { get; set; } = "0.0.0.0";
+        public int Port = 9100;
+        public float UpdateIntervalSeconds = 2f;
+        public bool EnablePerPlayerMetrics = false;
+        public string BindAddress = "0.0.0.0";
 
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "puck_metrics_config.json");
