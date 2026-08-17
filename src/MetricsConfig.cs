@@ -25,9 +25,11 @@ namespace PuckMetrics
         // Sync-state/log-size/process gauges.
         public bool EnableEngineHealth = true;
 
-        // Scene-wide transform census cadence; a full FindObjectsByType sweep
-        // is too heavy for every collect.
-        public float SceneCountIntervalSeconds = 30f;
+        // Scene-wide transform census cadence, 0 disables. The sweep is a
+        // single ~10ms native call — one long frame per census — so it runs
+        // rarely: it exists to catch a multi-day object leak, not to be a
+        // live gauge.
+        public float SceneCountIntervalSeconds = 300f;
 
         private static readonly string ConfigPath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory, "puck_metrics_config.json");

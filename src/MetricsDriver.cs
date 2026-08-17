@@ -27,6 +27,11 @@ namespace PuckMetrics
         private PlayerLoopTimer _stageTiming;
         private EngineHealthCollector _engineHealth;
         private float _lastSceneCountTime;
+        private bool _modTimingPending;
+
+        // Collection is spread one collector per frame (phase -1 = idle) so the
+        // interval tick never lands as a single multi-millisecond frame.
+        private int _collectPhase = -1;
 
         // Server info
         private MetricFamily _serverInfo;
@@ -92,20 +97,12 @@ namespace PuckMetrics
             DefineMetrics();
             SubscribeToEvents();
 
-            if (_config.EnableModTiming)
-            {
-                try
-                {
-                    _modTiming = new ModTimingProfiler();
-                    if (!_modTiming.TryInstall("com.tlan.puckmetrics.timing", _config.ModTimingAssemblyPrefixes))
-                        _modTiming = null;
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"[PuckMetrics] Mod timing failed to install: {ex.Message}");
-                    _modTiming = null;
-                }
-            }
+            // Mod timing installs on the first Update, NOT here: plugin folders
+            // load alphabetically and metrics/ sits mid-list, so a scan taken in
+            // Awake misses every assembly that loads after us (pugs, rules,
+            // sound, tags — the ones most worth timing). By the first frame all
+            // plugins are loaded.
+            _modTimingPending = _config.EnableModTiming;
 
             if (_config.EnableStageTiming)
                 _stageTiming = new PlayerLoopTimer();
@@ -287,26 +284,60 @@ namespace PuckMetrics
             if (dt > 0.05f)
                 _stallFrames++;
 
+            if (_modTimingPending)
+            {
+                _modTimingPending = false;
+                InstallModTiming();
+            }
+
             // Re-arms the stage markers too: Netcode rebuilds the player loop
             // when it installs its own systems, which drops ours.
             _stageTiming?.EnsureInstalled();
 
-            // Periodic full collection
-            if (Time.realtimeSinceStartup - _lastCollectTime >= _config.UpdateIntervalSeconds)
+            // Periodic collection, one collector per frame: a full pass in a
+            // single frame costs several milliseconds against a 2.8ms budget.
+            if (_collectPhase < 0 &&
+                Time.realtimeSinceStartup - _lastCollectTime >= _config.UpdateIntervalSeconds)
             {
-                CollectMetrics();
                 _lastCollectTime = Time.realtimeSinceStartup;
+                _collectPhase = 0;
+            }
+
+            if (_collectPhase >= 0)
+            {
+                RunCollectPhase(_collectPhase);
+                _collectPhase = _collectPhase < 4 ? _collectPhase + 1 : -1;
             }
         }
 
-        private void CollectMetrics()
+        private void InstallModTiming()
         {
-            CollectServerInfo();
-            CollectPlayerMetrics();
-            CollectGameState();
-            CollectPerformanceMetrics();
-            CollectAttribution();
-            CollectEngineHealth();
+            try
+            {
+                _modTiming = new ModTimingProfiler();
+                if (!_modTiming.TryInstall("com.tlan.puckmetrics.timing", _config.ModTimingAssemblyPrefixes))
+                    _modTiming = null;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[PuckMetrics] Mod timing failed to install: {ex.Message}");
+                _modTiming = null;
+            }
+        }
+
+        private void RunCollectPhase(int phase)
+        {
+            switch (phase)
+            {
+                case 0: CollectServerInfo(); break;
+                case 1: CollectPlayerMetrics(); break;
+                case 2: CollectGameState(); break;
+                case 3:
+                    CollectPerformanceMetrics();
+                    CollectAttribution();
+                    break;
+                case 4: CollectEngineHealth(); break;
+            }
         }
 
         private void CollectAttribution()
@@ -365,7 +396,8 @@ namespace PuckMetrics
                 if (handles >= 0)
                     _processHandles.Set(handles);
 
-                if (Time.realtimeSinceStartup - _lastSceneCountTime >= _config.SceneCountIntervalSeconds)
+                if (_config.SceneCountIntervalSeconds > 0 &&
+                    Time.realtimeSinceStartup - _lastSceneCountTime >= _config.SceneCountIntervalSeconds)
                 {
                     _lastSceneCountTime = Time.realtimeSinceStartup;
                     _sceneTransforms.Set(FindObjectsByType<Transform>(FindObjectsSortMode.None).Length);
