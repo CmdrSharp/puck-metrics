@@ -18,44 +18,68 @@ namespace PuckMetrics
 
         private readonly Dictionary<string, MetricSample> _samples = new Dictionary<string, MetricSample>();
 
+        // Shared with the registry: the main thread mutates samples while the
+        // HTTP thread serializes them, and a Dictionary enumerated during a
+        // Clear() or a resize misbehaves in ways that range from a scrape-time
+        // exception to the reader spinning. One registry-wide lock keeps every
+        // write and the whole Expose() pass mutually exclusive.
+        private readonly object _sync;
+
         public MetricFamily(string name, string help, MetricType type)
+            : this(name, help, type, new object())
+        {
+        }
+
+        internal MetricFamily(string name, string help, MetricType type, object sync)
         {
             Name = name;
             Help = help;
             Type = type;
+            _sync = sync;
         }
 
         public void Set(double value, params string[] labelValues)
         {
             var key = string.Join("\x1f", labelValues);
 
-            if (!_samples.TryGetValue(key, out var sample))
+            lock (_sync)
             {
-                sample = new MetricSample(labelValues);
-                _samples[key] = sample;
-            }
+                if (!_samples.TryGetValue(key, out var sample))
+                {
+                    sample = new MetricSample(labelValues);
+                    _samples[key] = sample;
+                }
 
-            sample.Value = value;
+                sample.Value = value;
+            }
         }
 
         public void Inc(double amount, params string[] labelValues)
         {
             var key = string.Join("\x1f", labelValues);
 
-            if (!_samples.TryGetValue(key, out var sample))
+            lock (_sync)
             {
-                sample = new MetricSample(labelValues);
-                _samples[key] = sample;
-            }
+                if (!_samples.TryGetValue(key, out var sample))
+                {
+                    sample = new MetricSample(labelValues);
+                    _samples[key] = sample;
+                }
 
-            sample.Value += amount;
+                sample.Value += amount;
+            }
         }
 
         public void Reset()
         {
-            _samples.Clear();
+            lock (_sync)
+            {
+                _samples.Clear();
+            }
         }
 
+        // Only safe to enumerate while holding the sync object this family was
+        // created with; Expose() does exactly that.
         public IReadOnlyDictionary<string, MetricSample> Samples => _samples;
     }
 
@@ -75,9 +99,12 @@ namespace PuckMetrics
         private readonly List<(MetricFamily family, string[] labelNames)> _families
             = new List<(MetricFamily, string[])>();
 
+        // One lock for the whole registry; see MetricFamily._sync.
+        private readonly object _sync = new object();
+
         public MetricFamily CreateGauge(string name, string help, params string[] labelNames)
         {
-            var family = new MetricFamily(name, help, MetricType.Gauge);
+            var family = new MetricFamily(name, help, MetricType.Gauge, _sync);
             _families.Add((family, labelNames));
 
             return family;
@@ -85,7 +112,7 @@ namespace PuckMetrics
 
         public MetricFamily CreateCounter(string name, string help, params string[] labelNames)
         {
-            var family = new MetricFamily(name, help, MetricType.Counter);
+            var family = new MetricFamily(name, help, MetricType.Counter, _sync);
             _families.Add((family, labelNames));
 
             return family;
@@ -95,6 +122,16 @@ namespace PuckMetrics
         {
             var sb = new StringBuilder(4096);
 
+            lock (_sync)
+            {
+                ExposeLocked(sb);
+            }
+
+            return sb.ToString();
+        }
+
+        private void ExposeLocked(StringBuilder sb)
+        {
             foreach (var (family, labelNames) in _families)
             {
                 sb.Append("# HELP ").Append(family.Name).Append(' ').AppendLine(family.Help);
@@ -124,8 +161,6 @@ namespace PuckMetrics
                     sb.Append(' ').AppendLine(sample.Value.ToString(CultureInfo.InvariantCulture));
                 }
             }
-
-            return sb.ToString();
         }
 
         private static string EscapeLabelValue(string value)

@@ -19,7 +19,14 @@ namespace PuckMetrics
         private float _frameTimeMax;
         private int _overrunFrames;
         private int _physicsStarvationFrames;
+        private int _stallFrames;
         private readonly List<float> _frameTimeSamples = new List<float>(512);
+
+        // Attribution + engine health (Phase 2 instrumentation)
+        private ModTimingProfiler _modTiming;
+        private PlayerLoopTimer _stageTiming;
+        private EngineHealthCollector _engineHealth;
+        private float _lastSceneCountTime;
 
         // Server info
         private MetricFamily _serverInfo;
@@ -58,6 +65,23 @@ namespace PuckMetrics
         private MetricFamily _gcCollectionsTotal;
         private MetricFamily _gcMemoryBytes;
         private MetricFamily _frameTimeRatio;
+        private MetricFamily _stallFramesTotal;
+
+        // Attribution
+        private MetricFamily _modFrameSecondsTotal;
+        private MetricFamily _modFrameMaxSeconds;
+        private MetricFamily _stageSecondsTotal;
+        private MetricFamily _stageMaxSeconds;
+
+        // Engine health
+        private MetricFamily _syncPlayerStates;
+        private MetricFamily _connectedClients;
+        private MetricFamily _networkObjects;
+        private MetricFamily _pucksSpawned;
+        private MetricFamily _sceneTransforms;
+        private MetricFamily _logFileBytes;
+        private MetricFamily _workingSetBytes;
+        private MetricFamily _processHandles;
 
         private void Awake()
         {
@@ -67,6 +91,27 @@ namespace PuckMetrics
 
             DefineMetrics();
             SubscribeToEvents();
+
+            if (_config.EnableModTiming)
+            {
+                try
+                {
+                    _modTiming = new ModTimingProfiler();
+                    if (!_modTiming.TryInstall("com.tlan.puckmetrics.timing", _config.ModTimingAssemblyPrefixes))
+                        _modTiming = null;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[PuckMetrics] Mod timing failed to install: {ex.Message}");
+                    _modTiming = null;
+                }
+            }
+
+            if (_config.EnableStageTiming)
+                _stageTiming = new PlayerLoopTimer();
+
+            if (_config.EnableEngineHealth)
+                _engineHealth = new EngineHealthCollector();
 
             try
             {
@@ -146,6 +191,36 @@ namespace PuckMetrics
                 "Total managed memory in bytes");
             _frameTimeRatio = _registry.CreateGauge("puck_frame_time_ratio",
                 "Ratio of actual avg frame time to target (>1 = server lagging)");
+            _stallFramesTotal = _registry.CreateCounter("puck_frames_over_50ms_total",
+                "Total frames that took longer than 50ms (visible hitches)");
+
+            // Attribution
+            _modFrameSecondsTotal = _registry.CreateCounter("puck_mod_frame_seconds_total",
+                "Main-thread seconds spent in a mod's script hooks", "mod", "hook");
+            _modFrameMaxSeconds = _registry.CreateGauge("puck_mod_frame_max_seconds",
+                "Slowest single invocation of a mod's script hook in the last interval", "mod", "hook");
+            _stageSecondsTotal = _registry.CreateCounter("puck_stage_seconds_total",
+                "Main-thread seconds spent per player-loop stage", "stage");
+            _stageMaxSeconds = _registry.CreateGauge("puck_stage_max_seconds",
+                "Slowest single pass of a player-loop stage in the last interval", "stage");
+
+            // Engine health
+            _syncPlayerStates = _registry.CreateGauge("puck_sync_player_states",
+                "SynchronizedPlayerState entries held by the replication manager (should equal connected clients)");
+            _connectedClients = _registry.CreateGauge("puck_connected_clients",
+                "Netcode connected clients");
+            _networkObjects = _registry.CreateGauge("puck_network_objects",
+                "Spawned NetworkObjects");
+            _pucksSpawned = _registry.CreateGauge("puck_pucks_spawned",
+                "Live puck objects");
+            _sceneTransforms = _registry.CreateGauge("puck_scene_transforms",
+                "Transforms in the scene (sampled on a slow cadence)");
+            _logFileBytes = _registry.CreateGauge("puck_log_file_bytes",
+                "Size of the game's own Puck.log");
+            _workingSetBytes = _registry.CreateGauge("puck_process_working_set_bytes",
+                "Resident memory of the server process");
+            _processHandles = _registry.CreateGauge("puck_process_handles",
+                "OS handle count of the server process (where supported)");
         }
 
         private void SubscribeToEvents()
@@ -209,6 +284,13 @@ namespace PuckMetrics
             if (dt > 0.04f)
                 _physicsStarvationFrames++;
 
+            if (dt > 0.05f)
+                _stallFrames++;
+
+            // Re-arms the stage markers too: Netcode rebuilds the player loop
+            // when it installs its own systems, which drops ours.
+            _stageTiming?.EnsureInstalled();
+
             // Periodic full collection
             if (Time.realtimeSinceStartup - _lastCollectTime >= _config.UpdateIntervalSeconds)
             {
@@ -223,6 +305,73 @@ namespace PuckMetrics
             CollectPlayerMetrics();
             CollectGameState();
             CollectPerformanceMetrics();
+            CollectAttribution();
+            CollectEngineHealth();
+        }
+
+        private void CollectAttribution()
+        {
+            try
+            {
+                _modTiming?.Collect((mod, hook, seconds, maxSeconds) =>
+                {
+                    _modFrameSecondsTotal.Inc(seconds, mod, hook);
+                    _modFrameMaxSeconds.Set(maxSeconds, mod, hook);
+                });
+
+                _stageTiming?.Collect((stage, seconds, maxSeconds) =>
+                {
+                    _stageSecondsTotal.Inc(seconds, stage);
+                    _stageMaxSeconds.Set(maxSeconds, stage);
+                });
+            }
+            catch { }
+        }
+
+        private void CollectEngineHealth()
+        {
+            if (_engineHealth == null)
+                return;
+
+            try
+            {
+                var syncStates = _engineHealth.SyncPlayerStateCount();
+                if (syncStates >= 0)
+                    _syncPlayerStates.Set(syncStates);
+
+                var networkManager = NetworkManager.Singleton;
+                if (networkManager != null && networkManager.IsServer)
+                {
+                    _connectedClients.Set(networkManager.ConnectedClientsList.Count);
+
+                    var spawned = networkManager.SpawnManager?.SpawnedObjects;
+                    if (spawned != null)
+                        _networkObjects.Set(spawned.Count);
+                }
+
+                var puckManager = MonoBehaviourSingleton<PuckManager>.Instance;
+                if (puckManager != null)
+                    _pucksSpawned.Set(puckManager.GetPucks(false).Count);
+
+                var logBytes = _engineHealth.LogFileBytes();
+                if (logBytes >= 0)
+                    _logFileBytes.Set(logBytes);
+
+                var workingSet = _engineHealth.WorkingSetBytes();
+                if (workingSet >= 0)
+                    _workingSetBytes.Set(workingSet);
+
+                var handles = _engineHealth.HandleCount();
+                if (handles >= 0)
+                    _processHandles.Set(handles);
+
+                if (Time.realtimeSinceStartup - _lastSceneCountTime >= _config.SceneCountIntervalSeconds)
+                {
+                    _lastSceneCountTime = Time.realtimeSinceStartup;
+                    _sceneTransforms.Set(FindObjectsByType<Transform>(FindObjectsSortMode.None).Length);
+                }
+            }
+            catch { }
         }
 
         private void CollectServerInfo()
@@ -380,6 +529,7 @@ namespace PuckMetrics
             // Overruns and starvation (cumulative counters)
             _frameOverrunsTotal.Set(_overrunFrames);
             _physicsStarvationTotal.Set(_physicsStarvationFrames);
+            _stallFramesTotal.Set(_stallFrames);
 
             // GC stats
             for (int gen = 0; gen <= GC.MaxGeneration; gen++)
@@ -405,6 +555,9 @@ namespace PuckMetrics
             }
             catch { }
 
+            _modTiming?.Uninstall();
+            _stageTiming?.Uninstall();
+            _engineHealth?.Dispose();
             _server?.Dispose();
             Debug.Log("[PuckMetrics] Shut down.");
         }
