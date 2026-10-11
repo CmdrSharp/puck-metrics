@@ -111,7 +111,52 @@ namespace PuckMetrics
 
             Debug.Log($"[PuckMetrics] Mod timing active on {PatchedCount} method(s) across " +
                       $"assemblies matching [{string.Join(", ", prefixes)}].");
-            return PatchedCount > 0;
+
+            // Keep the Harmony instance even with zero MonoBehaviour hooks: the
+            // simulate-subscriber scan may still find methods to time later.
+            return true;
+        }
+
+        /// <summary>True when this method already carries a timing bucket.</summary>
+        public bool IsPatched(MethodBase method)
+        {
+            return Buckets.ContainsKey(method);
+        }
+
+        /// <summary>
+        /// Patch one more method (found outside the MonoBehaviour scan, e.g. a
+        /// PhysicsManager event subscriber) with the same timing pair, under
+        /// the given hook label. Returns false when it was already timed or
+        /// could not be patched.
+        /// </summary>
+        public bool TryPatchMethod(MethodBase method, string mod, string hook)
+        {
+            if (_harmony == null || method == null) return false;
+            if (Buckets.ContainsKey(method)) return false;
+
+            var bucket = new Bucket(mod, hook);
+            Buckets[method] = bucket;
+
+            try
+            {
+                _harmony.Patch(method,
+                    new HarmonyMethod(typeof(ModTimingProfiler), nameof(TimingPrefix)),
+                    new HarmonyMethod(typeof(ModTimingProfiler), nameof(TimingPostfix)));
+                _all.Add(bucket);
+                PatchedCount++;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Buckets.Remove(method);
+                Debug.LogWarning($"[PuckMetrics] Could not time {method.DeclaringType?.Name}.{method.Name} ({hook}): {ex.Message}");
+                return false;
+            }
+        }
+
+        public static string MatchPrefix(string assemblyName, List<string> prefixes)
+        {
+            return MatchesAny(assemblyName, prefixes) ? assemblyName : null;
         }
 
         public void Uninstall()

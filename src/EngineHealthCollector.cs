@@ -22,7 +22,6 @@ namespace PuckMetrics
         private static readonly BindingFlags PrivateStatic = BindingFlags.NonPublic | BindingFlags.Static;
         private static readonly BindingFlags PrivateInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 
-        private Type _somType;
         private FieldInfo _somStatesField;
         private UnityEngine.Object _somInstance;
         private bool _somUnavailable;
@@ -41,12 +40,16 @@ namespace PuckMetrics
 
             try
             {
-                if (_somType == null)
+                if (_somStatesField == null)
                 {
-                    _somType = Type.GetType("SynchronizedObjectManager, Assembly-CSharp");
-                    _somStatesField = _somType?.GetField("serverSynchronizedPlayerStates", PrivateInstance);
+                    // The type is a compile-time reference (the game assembly is
+                    // "Puck", not "Assembly-CSharp"); only the private field is
+                    // reached by name so a build that renames it degrades this
+                    // gauge instead of failing the load.
+                    _somStatesField = typeof(SynchronizedObjectManager)
+                        .GetField("serverSynchronizedPlayerStates", PrivateInstance);
 
-                    if (_somType == null || _somStatesField == null)
+                    if (_somStatesField == null)
                     {
                         _somUnavailable = true;
                         Debug.Log("[PuckMetrics] Sync-state gauge off: SynchronizedObjectManager." +
@@ -55,8 +58,14 @@ namespace PuckMetrics
                     }
                 }
 
+                // Unity's overloaded null check re-resolves after a scene reload
+                // destroyed the previous instance.
                 if (_somInstance == null)
-                    _somInstance = UnityEngine.Object.FindAnyObjectByType(_somType) as UnityEngine.Object;
+                {
+                    _somInstance = NetworkBehaviourSingleton<SynchronizedObjectManager>.Instance;
+                    if (_somInstance == null)
+                        _somInstance = UnityEngine.Object.FindAnyObjectByType<SynchronizedObjectManager>();
+                }
 
                 if (_somInstance == null)
                     return -1;
@@ -82,8 +91,8 @@ namespace PuckMetrics
             {
                 if (_logFilePath == null)
                 {
-                    _logFilePath = Type.GetType("LogManager, Assembly-CSharp")
-                        ?.GetField("logFilePath", PrivateStatic)
+                    _logFilePath = typeof(LogManager)
+                        .GetField("logFilePath", PrivateStatic)
                         ?.GetValue(null) as string;
 
                     if (string.IsNullOrEmpty(_logFilePath))

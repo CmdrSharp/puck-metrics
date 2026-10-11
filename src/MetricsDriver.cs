@@ -29,8 +29,20 @@ namespace PuckMetrics
         private float _lastSceneCountTime;
         private bool _modTimingPending;
 
+        // B1235 tick-level collectors
+        private TickTimer _tickTimer;
+        private TransportStats _transport;
+        private ProcStats _proc;
+        private SimulateSubscriberTiming _subscribers;
+        private double _lastTickCollectTime;
+
+        // Physics tick interval (1 / PhysicsManager.TickRate), refreshed each
+        // collection; the frame thresholds below are expressed in it.
+        private float _tickInterval = 0.01f;
+
         // Collection is spread one collector per frame (phase -1 = idle) so the
         // interval tick never lands as a single multi-millisecond frame.
+        private const int LastCollectPhase = 6;
         private int _collectPhase = -1;
 
         // Server info
@@ -71,6 +83,49 @@ namespace PuckMetrics
         private MetricFamily _gcMemoryBytes;
         private MetricFamily _frameTimeRatio;
         private MetricFamily _stallFramesTotal;
+        private MetricFamily _targetFrameRate;
+        private MetricFamily _playerPingMax;
+        private MetricFamily _playerPingMin;
+
+        // Physics-step cadence
+        private MetricFamily _physicsTickRate;
+        private MetricFamily _physicsTickInterval;
+        private MetricFamily _physicsStepsTotal;
+        private MetricFamily _physicsStepsPerSecond;
+        private MetricFamily _physicsStepSecondsTotal;
+        private MetricFamily _physicsStepMaxSeconds;
+        private MetricFamily _physicsStepIntervalAvg;
+        private MetricFamily _physicsStepIntervalP99;
+        private MetricFamily _physicsStepIntervalMax;
+        private MetricFamily _physicsLateStepsTotal;
+        private MetricFamily _physicsSlowMoStepsTotal;
+        private MetricFamily _physicsBunchedFramesTotal;
+        private MetricFamily _physicsCatchUpStepsTotal;
+        private MetricFamily _physicsMaxStepsPerFrame;
+        private MetricFamily _timeScale;
+        private MetricFamily _timeScaleMin;
+
+        // Replication send
+        private MetricFamily _syncTicksTotal;
+        private MetricFamily _syncTickSecondsTotal;
+        private MetricFamily _syncTickMaxSeconds;
+
+        // Transport
+        private MetricFamily _transportTxBytes;
+        private MetricFamily _transportRxBytes;
+        private MetricFamily _transportTxPackets;
+        private MetricFamily _transportRxPackets;
+        private MetricFamily _transportRxStallMax;
+        private MetricFamily _transportDriverResets;
+
+        // Process / scheduler
+        private MetricFamily _mainThreadCpuSeconds;
+        private MetricFamily _mainThreadWaitSeconds;
+        private MetricFamily _mainThreadTimeslices;
+        private MetricFamily _processCpuSeconds;
+        private MetricFamily _processThreads;
+        private MetricFamily _processCtxtSwitches;
+        private MetricFamily _processRssBytes;
 
         // Attribution
         private MetricFamily _modFrameSecondsTotal;
@@ -110,6 +165,29 @@ namespace PuckMetrics
             if (_config.EnableEngineHealth)
                 _engineHealth = new EngineHealthCollector();
 
+            if (_config.EnableTickTiming)
+            {
+                _tickTimer = new TickTimer();
+                _tickTimer.Subscribe();
+                _tickInterval = _tickTimer.TickInterval;
+            }
+
+            if (_config.EnableSyncTickTiming)
+                SyncTickTimer.Install();
+
+            if (_config.EnableTransportStats)
+                _transport = new TransportStats();
+
+            if (_config.EnableProcStats)
+            {
+                if (ProcStats.Available)
+                    _proc = new ProcStats();
+                else
+                    Debug.Log("[PuckMetrics] Proc stats off: /proc not available on this platform.");
+            }
+
+            _lastTickCollectTime = Time.realtimeSinceStartupAsDouble;
+
             try
             {
                 _server = new MetricsHttpServer(_registry, _config.BindAddress, _config.Port);
@@ -125,7 +203,8 @@ namespace PuckMetrics
         {
             // Server info
             _serverInfo = _registry.CreateGauge("puck_server_info",
-                "Static server information as labels", "server_name", "game_mode", "level", "max_players", "tick_rate");
+                "Static server information as labels (tick_rate = configured serverConfig.tickRate, physics_tick_rate = PhysicsManager fixed-step rate)",
+                "server_name", "game_mode", "level", "max_players", "tick_rate", "physics_tick_rate");
             _serverUptime = _registry.CreateGauge("puck_server_uptime_seconds",
                 "Seconds since the server started");
 
@@ -140,6 +219,10 @@ namespace PuckMetrics
                 "Ratio of connected players to max players (0.0-1.0)");
             _playerPing = _registry.CreateGauge("puck_player_ping_milliseconds",
                 "Per-player ping in milliseconds", "steam_id", "username");
+            _playerPingMax = _registry.CreateGauge("puck_player_ping_max_milliseconds",
+                "Highest ping among connected players (0 when empty)");
+            _playerPingMin = _registry.CreateGauge("puck_player_ping_min_milliseconds",
+                "Lowest ping among connected players (0 when empty)");
 
             // Game state
             _gamePhase = _registry.CreateGauge("puck_game_phase",
@@ -165,7 +248,9 @@ namespace PuckMetrics
 
             // Performance
             _networkTickRate = _registry.CreateGauge("puck_network_tick_rate",
-                "Configured server network tick rate");
+                "Replication send rate: equals the physics fixed-step rate (PhysicsManager.TickRate) since B1235");
+            _targetFrameRate = _registry.CreateGauge("puck_target_frame_rate",
+                "Application.targetFrameRate (serverConfig.tickRate on a dedicated server); the main-loop cap, not the send rate");
             _actualFps = _registry.CreateGauge("puck_actual_fps",
                 "Actual server frames per second (smoothed)");
             _frameTimeAvg = _registry.CreateGauge("puck_frame_time_avg_seconds",
@@ -177,9 +262,9 @@ namespace PuckMetrics
             _frameTimeMax_metric = _registry.CreateGauge("puck_frame_time_max_seconds",
                 "Maximum frame time in the collection interval");
             _frameOverrunsTotal = _registry.CreateCounter("puck_frame_overruns_total",
-                "Total frames that exceeded target frame time");
+                "Frames longer than one physics tick interval (at least one fixed step landed in the frame; likely bunching)");
             _physicsStarvationTotal = _registry.CreateCounter("puck_physics_starvation_total",
-                "Total frames where physics simulation fell behind (>2x interval)");
+                "Frames longer than two physics tick intervals (Unity ran 2+ fixed steps and 2+ replication sends back-to-back)");
             _avgPlayerPing = _registry.CreateGauge("puck_average_player_ping_milliseconds",
                 "Average ping across all connected players");
             _gcCollectionsTotal = _registry.CreateCounter("puck_gc_collections_total",
@@ -187,7 +272,7 @@ namespace PuckMetrics
             _gcMemoryBytes = _registry.CreateGauge("puck_gc_memory_bytes",
                 "Total managed memory in bytes");
             _frameTimeRatio = _registry.CreateGauge("puck_frame_time_ratio",
-                "Ratio of actual avg frame time to target (>1 = server lagging)");
+                "Ratio of actual avg frame time to the target frame budget (1/targetFrameRate); >1 = main loop cannot hold its cap");
             _stallFramesTotal = _registry.CreateCounter("puck_frames_over_50ms_total",
                 "Total frames that took longer than 50ms (visible hitches)");
 
@@ -218,6 +303,79 @@ namespace PuckMetrics
                 "Resident memory of the server process");
             _processHandles = _registry.CreateGauge("puck_process_handles",
                 "OS handle count of the server process (where supported)");
+
+            // Physics-step cadence (B1235: PhysX runs from Unity's fixed-step
+            // loop and the replication send is coupled to it)
+            _physicsTickRate = _registry.CreateGauge("puck_physics_tick_rate",
+                "Physics fixed-step rate (PhysicsManager.TickRate); the replication send rate is coupled to it");
+            _physicsTickInterval = _registry.CreateGauge("puck_physics_tick_interval_seconds",
+                "Nominal seconds between fixed steps (1 / tick_rate)");
+            _physicsStepsTotal = _registry.CreateCounter("puck_physics_steps_total",
+                "Fixed physics steps executed");
+            _physicsStepsPerSecond = _registry.CreateGauge("puck_physics_steps_per_second",
+                "Fixed steps achieved per wall-clock second over the interval; below tick_rate * time_scale means simulation time is being discarded");
+            _physicsStepSecondsTotal = _registry.CreateCounter("puck_physics_step_seconds_total",
+                "Main-thread seconds between OnBeforeSimulate and OnAfterSimulate: PhysX + other FixedUpdate scripts + collision callbacks + earlier OnAfterSimulate subscribers");
+            _physicsStepMaxSeconds = _registry.CreateGauge("puck_physics_step_max_seconds",
+                "Longest single before->after span in the interval");
+            _physicsStepIntervalAvg = _registry.CreateGauge("puck_physics_step_interval_avg_seconds",
+                "Average wall-clock gap between consecutive fixed steps (slow-motion steps excluded)");
+            _physicsStepIntervalP99 = _registry.CreateGauge("puck_physics_step_interval_p99_seconds",
+                "99th percentile wall-clock gap between consecutive fixed steps (slow-motion steps excluded)");
+            _physicsStepIntervalMax = _registry.CreateGauge("puck_physics_step_interval_max_seconds",
+                "Longest wall-clock gap between consecutive fixed steps in the interval (slow-motion steps excluded)");
+            _physicsLateStepsTotal = _registry.CreateCounter("puck_physics_late_steps_total",
+                "Steps whose gap from the previous step exceeded N times the tick interval", "threshold");
+            _physicsSlowMoStepsTotal = _registry.CreateCounter("puck_physics_slowmo_steps_total",
+                "Steps taken with Time.timeScale < 1 (goal replays); excluded from late-step accounting");
+            _physicsBunchedFramesTotal = _registry.CreateCounter("puck_physics_bunched_frames_total",
+                "Frames that ran 2 or more fixed steps (catch-up); what clients feel as stutter");
+            _physicsCatchUpStepsTotal = _registry.CreateCounter("puck_physics_catchup_steps_total",
+                "Extra steps beyond the first in bunched frames");
+            _physicsMaxStepsPerFrame = _registry.CreateGauge("puck_physics_max_steps_per_frame",
+                "Most fixed steps run in one frame during the interval (1 = healthy; Unity caps near maximumDeltaTime / fixedDeltaTime)");
+            _timeScale = _registry.CreateGauge("puck_time_scale",
+                "Time.timeScale seen at the last fixed step");
+            _timeScaleMin = _registry.CreateGauge("puck_time_scale_min",
+                "Lowest Time.timeScale seen in the interval");
+
+            // Replication send
+            _syncTicksTotal = _registry.CreateCounter("puck_sync_ticks_total",
+                "Replication send ticks (SynchronizedObjectManager.Server_Tick calls)");
+            _syncTickSecondsTotal = _registry.CreateCounter("puck_sync_tick_seconds_total",
+                "Main-thread seconds inside Server_Tick (snapshot capture + per-client plan + RPC send)");
+            _syncTickMaxSeconds = _registry.CreateGauge("puck_sync_tick_max_seconds",
+                "Slowest Server_Tick in the interval");
+
+            // Transport
+            _transportTxBytes = _registry.CreateCounter("puck_transport_tx_bytes_total",
+                "UTP driver wire bytes sent, accumulated across driver restarts");
+            _transportRxBytes = _registry.CreateCounter("puck_transport_rx_bytes_total",
+                "UTP driver wire bytes received, accumulated across driver restarts");
+            _transportTxPackets = _registry.CreateCounter("puck_transport_tx_packets_total",
+                "UTP driver packets sent, accumulated across driver restarts");
+            _transportRxPackets = _registry.CreateCounter("puck_transport_rx_packets_total",
+                "UTP driver packets received, accumulated across driver restarts");
+            _transportRxStallMax = _registry.CreateGauge("puck_transport_rx_stall_max_seconds",
+                "Longest span in the interval during which the driver's received-packet count did not change");
+            _transportDriverResets = _registry.CreateCounter("puck_transport_driver_resets_total",
+                "Times the UTP driver statistics restarted from zero");
+
+            // Process / scheduler (Linux /proc)
+            _mainThreadCpuSeconds = _registry.CreateCounter("puck_main_thread_cpu_seconds_total",
+                "CPU time consumed by the Unity main thread (/proc/self/schedstat run time)");
+            _mainThreadWaitSeconds = _registry.CreateCounter("puck_main_thread_runqueue_wait_seconds_total",
+                "Time the main thread was runnable but waiting for a CPU (/proc/self/schedstat); a rising rate is CPU contention or steal");
+            _mainThreadTimeslices = _registry.CreateCounter("puck_main_thread_timeslices_total",
+                "Timeslices the main thread ran on a CPU (/proc/self/schedstat)");
+            _processCpuSeconds = _registry.CreateCounter("puck_process_cpu_seconds_total",
+                "CPU seconds of the whole server process by mode (/proc/self/stat)", "mode");
+            _processThreads = _registry.CreateGauge("puck_process_threads",
+                "Threads in the server process");
+            _processCtxtSwitches = _registry.CreateCounter("puck_process_ctxt_switches_total",
+                "Context switches of the main thread by type; nonvoluntary = preempted", "type");
+            _processRssBytes = _registry.CreateGauge("puck_process_rss_bytes",
+                "Resident set size of the server process (/proc/self/statm)");
         }
 
         private void SubscribeToEvents()
@@ -269,20 +427,21 @@ namespace PuckMetrics
             if (dt > _frameTimeMax) _frameTimeMax = dt;
             _frameTimeSamples.Add(dt);
 
-            // Detect overruns: frame took longer than target
-            float targetFrameTime = Application.targetFrameRate > 0
-                ? 1f / Application.targetFrameRate
-                : 0.005f;
-
-            if (dt > targetFrameTime * 1.1f)
+            // Thresholds are in physics tick intervals (10 ms at 100 Hz): a
+            // frame longer than one interval contains a fixed step and very
+            // likely two; longer than two intervals guarantees Unity ran 2+
+            // steps (and 2+ replication sends) back-to-back.
+            if (dt > _tickInterval)
                 _overrunFrames++;
 
-            // Physics starvation: frame so long that physics would need to double-step (2x the 50Hz physics interval)
-            if (dt > 0.04f)
+            if (dt > 2f * _tickInterval)
                 _physicsStarvationFrames++;
 
             if (dt > 0.05f)
                 _stallFrames++;
+
+            _tickTimer?.OnFrame();
+            _transport?.Sample();
 
             if (_modTimingPending)
             {
@@ -306,7 +465,7 @@ namespace PuckMetrics
             if (_collectPhase >= 0)
             {
                 RunCollectPhase(_collectPhase);
-                _collectPhase = _collectPhase < 4 ? _collectPhase + 1 : -1;
+                _collectPhase = _collectPhase < LastCollectPhase ? _collectPhase + 1 : -1;
             }
         }
 
@@ -317,6 +476,8 @@ namespace PuckMetrics
                 _modTiming = new ModTimingProfiler();
                 if (!_modTiming.TryInstall("com.tlan.puckmetrics.timing", _config.ModTimingAssemblyPrefixes))
                     _modTiming = null;
+                else
+                    _subscribers = new SimulateSubscriberTiming(_modTiming, _config.ModTimingAssemblyPrefixes);
             }
             catch (Exception ex)
             {
@@ -337,13 +498,112 @@ namespace PuckMetrics
                     CollectAttribution();
                     break;
                 case 4: CollectEngineHealth(); break;
+                case 5: CollectTickTiming(); break;
+                case 6: CollectTransportAndProc(); break;
             }
+        }
+
+        private void CollectTickTiming()
+        {
+            try
+            {
+                double now = Time.realtimeSinceStartupAsDouble;
+                double wall = now - _lastTickCollectTime;
+                _lastTickCollectTime = now;
+
+                if (_tickTimer != null)
+                {
+                    var s = _tickTimer.Collect();
+                    _tickInterval = s.TickInterval;
+
+                    _physicsTickRate.Set(s.TickRate);
+                    _physicsTickInterval.Set(s.TickInterval);
+                    _physicsStepsTotal.Inc(s.Steps);
+                    _physicsStepsPerSecond.Set(wall > 0 ? s.Steps / wall : 0);
+                    _physicsStepSecondsTotal.Inc(s.StepSeconds);
+                    _physicsStepMaxSeconds.Set(s.StepMaxSeconds);
+                    _physicsStepIntervalAvg.Set(s.IntervalAvgSeconds);
+                    _physicsStepIntervalP99.Set(s.IntervalP99Seconds);
+                    _physicsStepIntervalMax.Set(s.IntervalMaxSeconds);
+                    _physicsLateStepsTotal.Inc(s.LateOver2x, "2x");
+                    _physicsLateStepsTotal.Inc(s.LateOver5x, "5x");
+                    _physicsSlowMoStepsTotal.Inc(s.SlowMoSteps);
+                    _physicsBunchedFramesTotal.Inc(s.BunchedFrames);
+                    _physicsCatchUpStepsTotal.Inc(s.CatchUpSteps);
+                    _physicsMaxStepsPerFrame.Set(s.MaxStepsPerFrame);
+                    _timeScale.Set(s.TimeScale);
+                    _timeScaleMin.Set(s.TimeScaleMin);
+                }
+
+                if (SyncTickTimer.Installed)
+                {
+                    long ticks; double seconds, maxSeconds;
+                    SyncTickTimer.Collect(out ticks, out seconds, out maxSeconds);
+                    _syncTicksTotal.Inc(ticks);
+                    _syncTickSecondsTotal.Inc(seconds);
+                    _syncTickMaxSeconds.Set(maxSeconds);
+                }
+            }
+            catch { }
+        }
+
+        private void CollectTransportAndProc()
+        {
+            try
+            {
+                if (_transport != null)
+                {
+                    var t = _transport.Collect();
+                    if (t.DriverAvailable)
+                    {
+                        _transportTxBytes.Set(t.TxBytes);
+                        _transportRxBytes.Set(t.RxBytes);
+                        _transportTxPackets.Set(t.TxPackets);
+                        _transportRxPackets.Set(t.RxPackets);
+                        _transportDriverResets.Set(t.DriverResets);
+                    }
+                    _transportRxStallMax.Set(t.RxStallMaxSeconds);
+                }
+
+                if (_proc != null)
+                {
+                    var p = new ProcStats.Sample();
+                    if (_proc.TryRead(ref p))
+                    {
+                        if (p.HasSchedstat)
+                        {
+                            _mainThreadCpuSeconds.Set(p.MainRunSeconds);
+                            _mainThreadWaitSeconds.Set(p.MainWaitSeconds);
+                            _mainThreadTimeslices.Set(p.MainTimeslices);
+                        }
+
+                        if (p.HasStat)
+                        {
+                            _processCpuSeconds.Set(p.UserSeconds, "user");
+                            _processCpuSeconds.Set(p.SystemSeconds, "system");
+                        }
+
+                        if (p.HasStatus)
+                        {
+                            _processThreads.Set(p.Threads);
+                            _processCtxtSwitches.Set(p.VoluntaryCtxt, "voluntary");
+                            _processCtxtSwitches.Set(p.NonvoluntaryCtxt, "nonvoluntary");
+                        }
+
+                        if (p.HasStatm)
+                            _processRssBytes.Set(p.RssBytes);
+                    }
+                }
+            }
+            catch { }
         }
 
         private void CollectAttribution()
         {
             try
             {
+                _subscribers?.Scan();
+
                 _modTiming?.Collect((mod, hook, seconds, maxSeconds) =>
                 {
                     _modFrameSecondsTotal.Inc(seconds, mod, hook);
@@ -415,15 +675,24 @@ namespace PuckMetrics
 
                 var config = serverManager.ServerConfig;
 
+                int physicsTickRate = 0;
+                var physicsManager = MonoBehaviourSingleton<PhysicsManager>.Instance;
+                if (physicsManager != null)
+                    physicsTickRate = physicsManager.TickRate;
+                else if (Time.fixedDeltaTime > 0f)
+                    physicsTickRate = (int)Math.Round(1f / Time.fixedDeltaTime);
+
                 _serverInfo.Set(1,
                     config.name ?? "",
                     config.gameMode ?? "",
                     config.level ?? "",
                     config.maxPlayers.ToString(),
-                    config.tickRate.ToString());
+                    config.tickRate.ToString(),
+                    physicsTickRate.ToString());
 
                 _serverUptime.Set(Time.realtimeSinceStartup - _startTime);
-                _networkTickRate.Set(config.tickRate);
+                _networkTickRate.Set(physicsTickRate);
+                _targetFrameRate.Set(Application.targetFrameRate);
             }
             catch { }
         }
@@ -482,9 +751,11 @@ namespace PuckMetrics
                 _playersByRole.Set(goalies, "goalie");
                 _playersByRole.Set(noRole, "none");
 
-                // Per-player ping + average
+                // Per-player ping + average / spread
                 double pingSum = 0;
                 int pingCount = 0;
+                ulong pingMax = 0;
+                ulong pingMin = ulong.MaxValue;
 
                 if (_config.EnablePerPlayerMetrics)
                     _playerPing.Reset();
@@ -494,6 +765,8 @@ namespace PuckMetrics
                     var ping = player.Ping.Value;
                     pingSum += ping;
                     pingCount++;
+                    if (ping > pingMax) pingMax = ping;
+                    if (ping < pingMin) pingMin = ping;
 
                     if (_config.EnablePerPlayerMetrics)
                     {
@@ -504,6 +777,8 @@ namespace PuckMetrics
                 }
 
                 _avgPlayerPing.Set(pingCount > 0 ? pingSum / pingCount : 0);
+                _playerPingMax.Set(pingCount > 0 ? pingMax : 0);
+                _playerPingMin.Set(pingCount > 0 ? pingMin : 0);
             }
             catch { }
         }
@@ -587,6 +862,9 @@ namespace PuckMetrics
             }
             catch { }
 
+            _tickTimer?.Unsubscribe();
+            SyncTickTimer.Uninstall();
+            _transport?.Dispose();
             _modTiming?.Uninstall();
             _stageTiming?.Uninstall();
             _engineHealth?.Dispose();

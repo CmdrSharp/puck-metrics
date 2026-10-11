@@ -16,7 +16,10 @@ namespace PuckMetrics
         // prefixes. Deliberately not "every mod": per-object third-party mods
         // would multiply the (tiny) per-call overhead, and their cost shows up
         // in the stage timers as the script-stage residual anyway.
-        public bool EnableModTiming = true;
+        //
+        // Off by default: it detours every timed method with Harmony. Flip it on
+        // for an attribution run, not as a standing production setting.
+        public bool EnableModTiming = false;
         public string[] ModTimingAssemblyPrefixes = new[] { "TLAN", "PuckMetrics" };
 
         // Engine-stage timing via player-loop markers.
@@ -24,6 +27,20 @@ namespace PuckMetrics
 
         // Sync-state/log-size/process gauges.
         public bool EnableEngineHealth = true;
+
+        // Physics-step cadence from PhysicsManager.OnBeforeSimulate/OnAfterSimulate:
+        // steps per frame, late steps, step span. No Harmony involved.
+        public bool EnableTickTiming = true;
+
+        // Harmony-timed SynchronizedObjectManager.Server_Tick (replication send).
+        public bool EnableSyncTickTiming = true;
+
+        // Unity Transport driver byte/packet counters and receive-stall watch.
+        public bool EnableTransportStats = true;
+
+        // /proc/self scheduler evidence (Linux only): main-thread run-queue
+        // wait, CPU split, context switches, threads, RSS.
+        public bool EnableProcStats = true;
 
         // Scene-wide transform census cadence, 0 disables. The sweep is a
         // single ~10ms native call — one long frame per census — so it runs
@@ -47,7 +64,11 @@ namespace PuckMetrics
                 var json = File.ReadAllText(ConfigPath);
                 var config = JsonUtility.FromJson<MetricsConfig>(json);
 
-                Debug.Log($"[PuckMetrics] Config loaded: port={config.Port}, interval={config.UpdateIntervalSeconds}s, perPlayer={config.EnablePerPlayerMetrics}");
+                Debug.Log($"[PuckMetrics] Config loaded: port={config.Port}, interval={config.UpdateIntervalSeconds}s, " +
+                          $"perPlayer={config.EnablePerPlayerMetrics}, modTiming={config.EnableModTiming}, " +
+                          $"stageTiming={config.EnableStageTiming}, tickTiming={config.EnableTickTiming}, " +
+                          $"syncTickTiming={config.EnableSyncTickTiming}, transportStats={config.EnableTransportStats}, " +
+                          $"procStats={config.EnableProcStats}");
                 return config;
             }
             catch (Exception ex)
